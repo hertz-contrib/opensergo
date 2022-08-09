@@ -1,1 +1,1 @@
-# opensergo
+# opensergo (This is a community driven project)
