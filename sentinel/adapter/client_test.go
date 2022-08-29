@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sentinel
+package adapter
 
 import (
 	"context"
@@ -22,20 +22,20 @@ import (
 	sentinel "github.com/alibaba/sentinel-golang/api"
 	"github.com/alibaba/sentinel-golang/core/flow"
 	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/cloudwego/hertz/pkg/common/config"
-	"github.com/cloudwego/hertz/pkg/common/ut"
-	"github.com/cloudwego/hertz/pkg/route"
+	"github.com/cloudwego/hertz/pkg/app/client"
+	"github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/cloudwego/hertz/pkg/protocol"
 	"github.com/stretchr/testify/assert"
 )
 
-func initServerSentinel(t *testing.T) {
+func initSentinelForClient(t *testing.T) {
 	err := sentinel.InitDefault()
 	if err != nil {
 		t.Fatalf("Unexpected error: %+v", err)
 	}
 	_, err = flow.LoadRules([]*flow.Rule{
 		{
-			Resource:               "GET:/server_ping",
+			Resource:               "GET:/client_ping",
 			Threshold:              1.0,
 			TokenCalculateStrategy: flow.Direct,
 			ControlBehavior:        flow.Reject,
@@ -55,16 +55,15 @@ func initServerSentinel(t *testing.T) {
 	}
 }
 
-func TestServerSentinelMiddleware(t *testing.T) {
+func TestClientSentinelMiddleware(t *testing.T) {
 	type args struct {
-		opts    []ServerOption
+		opts    []ClientOption
 		method  string
-		path    string
 		reqPath string
-		handler func(c context.Context, ctx *app.RequestContext)
 	}
 	type want struct {
-		code int
+		code  int
+		isErr bool
 	}
 	tests := []struct {
 		name string
@@ -74,68 +73,75 @@ func TestServerSentinelMiddleware(t *testing.T) {
 		{
 			name: "default get",
 			args: args{
-				opts:    []ServerOption{},
+				opts:    []ClientOption{},
 				method:  http.MethodGet,
-				path:    "/server_ping",
-				reqPath: "/server_ping",
-				handler: func(c context.Context, ctx *app.RequestContext) {
-					ctx.String(http.StatusOK, "ping")
-				},
+				reqPath: "http://localhost:3000/client_ping",
 			},
 			want: want{
-				code: http.StatusOK,
+				code:  http.StatusOK,
+				isErr: false,
 			},
 		},
 		{
 			name: "customize resource extract",
 			args: args{
-				opts: []ServerOption{
-					WithServerResourceExtractor(func(c context.Context, ctx *app.RequestContext) string {
-						return ctx.FullPath()
+				opts: []ClientOption{
+					WithClientResourceExtractor(func(ctx context.Context, req *protocol.Request, resp *protocol.Response) string {
+						return "/api/users/:id"
 					}),
 				},
 				method:  http.MethodGet,
-				path:    "/api/users/:id",
-				reqPath: "/api/users/123",
-				handler: func(c context.Context, ctx *app.RequestContext) {
-					ctx.String(http.StatusOK, "ping")
-				},
+				reqPath: "http://localhost:3000/api/users/123",
 			},
 			want: want{
-				code: http.StatusTooManyRequests,
+				code:  http.StatusTooManyRequests,
+				isErr: true,
 			},
 		},
-
 		{
 			name: "customize block fallback",
 			args: args{
-				opts: []ServerOption{
-					WithServerBlockFallback(func(c context.Context, ctx *app.RequestContext) {
-						ctx.String(http.StatusBadRequest, "block")
+				opts: []ClientOption{
+					WithClientBlockFallback(func(ctx context.Context, req *protocol.Request, resp *protocol.Response, blockError error) error {
+						resp.SetStatusCode(http.StatusBadRequest)
+						return blockError
 					}),
 				},
 				method:  http.MethodGet,
-				path:    "/server_ping",
-				reqPath: "/server_ping",
-				handler: func(c context.Context, ctx *app.RequestContext) {
-					ctx.String(http.StatusBadRequest, "")
-				},
+				reqPath: "http://localhost:3000/client_ping",
 			},
 			want: want{
-				code: http.StatusBadRequest,
+				code:  http.StatusBadRequest,
+				isErr: true,
 			},
 		},
 	}
-	initServerSentinel(t)
+	go func() {
+		h := server.New(server.WithHostPorts(":3000"))
+		h.GET("/client_ping", func(c context.Context, ctx *app.RequestContext) {
+			ctx.String(200, "pong")
+		})
+		h.GET("/api/users/:id", func(c context.Context, ctx *app.RequestContext) {
+			ctx.String(200, "pong")
+		})
+		h.Spin()
+	}()
+	initSentinelForClient(t)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			opt := config.NewOptions([]config.Option{})
-			router := route.NewEngine(opt)
-			router.Use(SentinelServerMiddleware(tt.args.opts...))
-			router.Handle(tt.args.method, tt.args.path, tt.args.handler)
-			w := ut.PerformRequest(router, tt.args.method, tt.args.reqPath, nil)
-			resp := w.Result()
-			assert.Equal(t, tt.want.code, resp.StatusCode())
+			c, err := client.NewClient()
+			if err != nil {
+				t.Fatalf("Unexpected error: %+v", err)
+				return
+			}
+			c.Use(SentinelClientMiddleware(tt.args.opts...))
+			req := &protocol.Request{}
+			res := &protocol.Response{}
+			req.SetMethod(tt.args.method)
+			req.SetRequestURI(tt.args.reqPath)
+			err = c.Do(context.Background(), req, res)
+			assert.Equal(t, tt.want.isErr, err != nil)
+			assert.Equal(t, tt.want.code, res.StatusCode())
 		})
 	}
 }
